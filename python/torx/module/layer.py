@@ -56,8 +56,8 @@ class crxb_Conv2d_dw(nn.Conv2d):
         self.crxb_size = crxb_size
         self.enable_ec_SAF = enable_ec_SAF
 
-        self.nchout_index = nn.Parameter(torch.arange(self.out_channels), requires_grad=False)
-        weight_flatten = self.weight.view(self.out_channels, -1)
+        self.nchout_index = nn.Parameter(torch.arange(1), requires_grad=False)
+        weight_flatten = self.weight.view(1, -1)
         self.crxb_row, self.crxb_row_pads = self.num_pad(
             weight_flatten.shape[1], self.crxb_size)
         self.crxb_col, self.crxb_col_pads = self.num_pad(
@@ -137,7 +137,7 @@ class crxb_Conv2d_dw(nn.Conv2d):
         input_unfold = F.unfold(input_quan, kernel_size=self.kernel_size[0],
                                 dilation=self.dilation, padding=self.padding,
                                 stride=self.stride)
-        weight_flatten = weight_quan.view(self.out_channels, -1)
+        weight_flatten = weight_quan.view(1, -1)
 
         # 2.2. add paddings
         weight_padded = F.pad(weight_flatten, self.w_pad,
