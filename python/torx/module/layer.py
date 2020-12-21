@@ -44,7 +44,7 @@ class crxb_Conv2d_dw(nn.Conv2d):
                  gload, scaler_dw=1, vdd=3.3, stride=1, padding=0, dilation=1, enable_noise=True,
                  freq=10e6, temp=300, groups=1, bias=True, crxb_size=64, quantize=8, enable_SAF=False,
                  enable_ec_SAF=False):
-        super(crxb_Conv2d, self).__init__(in_channels, out_channels, kernel_size,
+        super(crxb_Conv2d_dw, self).__init__(in_channels, out_channels, kernel_size,
                                           stride, padding, dilation, groups, bias)
 
         assert self.groups == self.in_channels, "In pytorch, depth-wise conv is implemented by setting groups = in_channels" 
@@ -108,31 +108,41 @@ class crxb_Conv2d_dw(nn.Conv2d):
         num_padding = crxb_index * target - source
         return crxb_index, num_padding
     
-    def forward(self, input):
-        
+    def forward(self, input):        
         output = []
         for i in range(self.in_channels):
-            output.append(forward_helper(self, input[i], i))
-        torch.cat(output, 1)
+            index = torch.tensor([i]).to(input.device)
+            output.append(self.forward_helper(torch.index_select(input, 1, index), index))
+        output_ = torch.cat(output, 1)
+        return output_
 
     def forward_helper(self, input, index):
         # 1. input data and weight quantization
+        w = torch.index_select(self.weight, 0, index)
         with torch.no_grad():
-            self.delta_w = self.weight[index].abs().max() / self.h_lvl * self.scaler_dw
+            self.delta_w = w.abs().max() / self.h_lvl * self.scaler_dw
             if self.training:
                 self.counter.data += 1
                 self.delta_x = input.abs().max() / self.h_lvl
                 self.delta_in_sum.data += self.delta_x
             else:
                 self.delta_x = self.delta_in_sum.data / self.counter.data
-
+        
         input_clip = F.hardtanh(input, min_val=-self.h_lvl * self.delta_x.item(),
                                 max_val=self.h_lvl * self.delta_x.item())
         input_quan = quantize_input(
             input_clip, self.delta_x) * self.delta_v  # convert to voltage
+        weight_flatten = w.view(1, -1)
+        
+        weight_quan = quantize_weight(w, self.delta_w)
 
-        weight_quan = quantize_weight(self.weight, self.delta_w)
-
+        crxb_r, crxb_r_pads = self.num_pad(
+            weight_flatten.shape[1], self.crxb_size)  # Redefine r, r_pads
+        crxb_c, crxb_c_pads = self.num_pad(
+            weight_flatten.shape[0], self.crxb_size)  # Redefine c, c_pads
+        in_pad = (0, 0, 0, crxb_r_pads)
+        w_pad = (0, crxb_r_pads, 0, crxb_c_pads)
+        
         # 2. Perform the computation between input voltage and weight conductance
         if self.h_out is None and self.w_out is None:
             self.h_out = int(
@@ -144,18 +154,20 @@ class crxb_Conv2d_dw(nn.Conv2d):
         input_unfold = F.unfold(input_quan, kernel_size=self.kernel_size[0],
                                 dilation=self.dilation, padding=self.padding,
                                 stride=self.stride)
-        weight_flatten = weight_quan.view(self.out_channels, -1)
+        #weight_flatten = weight_quan.view(1, -1) # change self.out_channels to 1
 
         # 2.2. add paddings
-        weight_padded = F.pad(weight_flatten, self.w_pad,
+        weight_padded = F.pad(weight_flatten, w_pad,
                               mode='constant', value=0)
-        input_padded = F.pad(input_unfold, self.input_pad,
+        input_padded = F.pad(input_unfold, in_pad,
                              mode='constant', value=0)
         # 2.3. reshape to crxb size
-        input_crxb = input_padded.view(input.shape[0], 1, self.crxb_row,
-                                       self.crxb_size, input_padded.shape[2])
-        weight_crxb = weight_padded.view(self.crxb_col, self.crxb_size,
-                                         self.crxb_row, self.crxb_size).transpose(1, 2)
+
+        input_crxb = input_padded.view(input.shape[0], 1, crxb_r,
+                                       self.crxb_size, input_padded.shape[2]) #change
+        
+        weight_crxb = weight_padded.view(crxb_c, self.crxb_size,
+                                         crxb_r, self.crxb_size).transpose(1, 2) #change
         # convert the floating point weight into conductance pair values
         G_crxb = self.w2g(weight_crxb)
 
@@ -183,9 +195,8 @@ class crxb_Conv2d_dw(nn.Conv2d):
                                  output_sum.shape[1] * output_sum.shape[2],
                                  self.h_out,
                                  self.w_out).index_select(dim=1, index=self.nchout_index)
-
         if self.bias is not None:
-            output += self.bias.unsqueeze(1).unsqueeze(1)
+            output += torch.index_select(self.bias, 0, index).unsqueeze(1).unsqueeze(1)
 
         return output
 
@@ -300,8 +311,6 @@ class crxb_Conv2d(nn.Conv2d):
                 self.delta_in_sum.data += self.delta_x
             else:
                 self.delta_x = self.delta_in_sum.data / self.counter.data
-        print("input shape: ", input.shape)
-        print("weight shape: ", self.weight.shape)
 
         input_clip = F.hardtanh(input, min_val=-self.h_lvl * self.delta_x.item(),
                                 max_val=self.h_lvl * self.delta_x.item())
@@ -322,7 +331,6 @@ class crxb_Conv2d(nn.Conv2d):
                                 dilation=self.dilation, padding=self.padding,
                                 stride=self.stride)
         weight_flatten = weight_quan.view(self.out_channels, -1)
-
         # 2.2. add paddings
         weight_padded = F.pad(weight_flatten, self.w_pad,
                               mode='constant', value=0)
