@@ -78,8 +78,6 @@ class Net(nn.Module):
         return F.log_softmax(x, dim=1)
 
 
-
-
 def train(model, device, criterion, optimizer, train_loader, epoch):
     losses = AverageMeter()
 
