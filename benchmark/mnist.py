@@ -141,12 +141,14 @@ def validate(args, model, device, criterion, val_loader):
 def main():
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
+    parser.add_argument('--cuda', type=str, default='0', metavar='C',
+                        help='CUDA Visible devices')
     parser.add_argument('--batch_size', type=int, default=1000, metavar='N',
                         help='input batch size for training (default: 64)')
     parser.add_argument('--test_batch_size', type=int, default=100, metavar='N',
                         help='input batch size for testing (default: 1000)')
     parser.add_argument('--epochs', type=int, default=1, metavar='N',
-                        help='number of epochs to train (default: 10)')
+                        help='number of epochs to train (default: 1)')
     parser.add_argument('--lr', type=float, default=0.5, metavar='LR',
                         help='learning rate (default: 0.01)')
     parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
@@ -205,7 +207,7 @@ def main():
 
     torch.manual_seed(args.seed)
 
-    device = torch.device("cuda" if use_cuda else "cpu")
+    device = torch.device('cuda:'+args.cuda if use_cuda else "cpu")
 
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
     train_loader = torch.utils.data.DataLoader(

@@ -56,199 +56,6 @@ class crxb_Conv2d_dw(nn.Conv2d):
         self.crxb_size = crxb_size
         self.enable_ec_SAF = enable_ec_SAF
 
-        self.nchout_index = nn.Parameter(torch.arange(1), requires_grad=False)
-        weight_flatten = self.weight.view(1, -1)
-        self.crxb_row, self.crxb_row_pads = self.num_pad(
-            weight_flatten.shape[1], self.crxb_size)
-        self.crxb_col, self.crxb_col_pads = self.num_pad(
-            weight_flatten.shape[0], self.crxb_size)
-        self.h_out = None
-        self.w_out = None
-        self.w_pad = (0, self.crxb_row_pads, 0, self.crxb_col_pads)
-        self.input_pad = (0, 0, 0, self.crxb_row_pads)
-        weight_padded = F.pad(weight_flatten, self.w_pad,
-                              mode='constant', value=0)
-        weight_crxb = weight_padded.view(self.crxb_col, self.crxb_size,
-                                         self.crxb_row, self.crxb_size).transpose(1, 2)
-
-        ################# Hardware conversion ##############################
-        # weight and input levels
-        self.n_lvl = 2 ** quantize
-        self.h_lvl = (self.n_lvl - 2) / 2
-        # ReRAM cells
-        self.Gmax = gmax  # max conductance
-        self.Gmin = gmin  # min conductance
-        self.delta_g = (self.Gmax - self.Gmin) / (2 ** 7)  # conductance step
-        self.w2g = w2g(self.delta_g, Gmin=self.Gmin, G_SA0=self.Gmax,
-                       G_SA1=self.Gmin, weight_shape=weight_crxb.shape, enable_SAF=enable_SAF)
-        self.Gwire = gwire
-        self.Gload = gload
-        # DAC
-        self.Vdd = vdd  # unit: volt
-        self.delta_v = self.Vdd / (self.n_lvl - 1)
-        self.delta_in_sum = nn.Parameter(torch.Tensor(1), requires_grad=False)
-        self.delta_out_sum = nn.Parameter(torch.Tensor(1), requires_grad=False)
-        self.counter = nn.Parameter(torch.Tensor(1), requires_grad=False)
-        self.scaler_dw = scaler_dw
-
-        ################ Stochastic Conductance Noise setup #########################
-        # parameters setup
-        self.enable_stochastic_noise = enable_noise
-        self.freq = freq  # operating frequency
-        self.kb = 1.38e-23  # Boltzmann const
-        self.temp = temp  # temperature in kelvin
-        self.q = 1.6e-19  # electron charge
-
-        self.tau = 0.5  # Probability of RTN
-        self.a = 1.662e-7  # RTN fitting parameter
-        self.b = 0.0015  # RTN fitting parameter
-
-    def num_pad(self, source, target):
-        crxb_index = math.ceil(source / target)
-        num_padding = crxb_index * target - source
-        return crxb_index, num_padding
-    
-    def forward(self, input):        
-        output = []
-        for i in range(self.in_channels):
-            index = torch.tensor([i]).to(input.device)
-            output.append(self.forward_helper(torch.index_select(input, 1, index), index))
-        output_ = torch.cat(output, 1)
-        return output_
-
-    def forward_helper(self, input, index):
-        # 1. input data and weight quantization
-        w = torch.index_select(self.weight, 0, index)
-        with torch.no_grad():
-            self.delta_w = w.abs().max() / self.h_lvl * self.scaler_dw
-            if self.training:
-                self.counter.data += 1
-                self.delta_x = input.abs().max() / self.h_lvl
-                self.delta_in_sum.data += self.delta_x
-            else:
-                self.delta_x = self.delta_in_sum.data / self.counter.data
-        
-        input_clip = F.hardtanh(input, min_val=-self.h_lvl * self.delta_x.item(),
-                                max_val=self.h_lvl * self.delta_x.item())
-        input_quan = quantize_input(
-            input_clip, self.delta_x) * self.delta_v  # convert to voltage
-        weight_flatten = w.view(1, -1)
-        
-        weight_quan = quantize_weight(w, self.delta_w)
-
-        crxb_r, crxb_r_pads = self.num_pad(
-            weight_flatten.shape[1], self.crxb_size)  # Redefine r, r_pads
-        crxb_c, crxb_c_pads = self.num_pad(
-            weight_flatten.shape[0], self.crxb_size)  # Redefine c, c_pads
-        in_pad = (0, 0, 0, crxb_r_pads)
-        w_pad = (0, crxb_r_pads, 0, crxb_c_pads)
-        
-        # 2. Perform the computation between input voltage and weight conductance
-        if self.h_out is None and self.w_out is None:
-            self.h_out = int(
-                (input.shape[2] - self.kernel_size[0] + 2 * self.padding[0]) / self.stride[0] + 1)
-            self.w_out = int(
-                (input.shape[3] - self.kernel_size[0] + 2 * self.padding[0]) / self.stride[0] + 1)
-
-        # 2.1 flatten and unfold the weight and input
-        input_unfold = F.unfold(input_quan, kernel_size=self.kernel_size[0],
-                                dilation=self.dilation, padding=self.padding,
-                                stride=self.stride)
-        #weight_flatten = weight_quan.view(1, -1) # change self.out_channels to 1
-
-        # 2.2. add paddings
-        weight_padded = F.pad(weight_flatten, w_pad,
-                              mode='constant', value=0)
-        input_padded = F.pad(input_unfold, in_pad,
-                             mode='constant', value=0)
-        # 2.3. reshape to crxb size
-
-        input_crxb = input_padded.view(input.shape[0], 1, crxb_r,
-                                       self.crxb_size, input_padded.shape[2]) #change
-        
-        weight_crxb = weight_padded.view(crxb_c, self.crxb_size,
-                                         crxb_r, self.crxb_size).transpose(1, 2) #change
-        # convert the floating point weight into conductance pair values
-        G_crxb = self.w2g(weight_crxb)
-
-        # 2.4. compute matrix multiplication followed by reshapes
-
-        output_crxb = torch.matmul(G_crxb[0], input_crxb) - \
-                          torch.matmul(G_crxb[1], input_crxb)
-
-        # 3. perform ADC operation (i.e., current to digital conversion)
-        with torch.no_grad():
-            if self.training:
-                self.delta_i = output_crxb.abs().max() / (self.h_lvl)
-                self.delta_out_sum.data += self.delta_i
-            else:
-                self.delta_i = self.delta_out_sum.data / self.counter.data
-            self.delta_y = self.delta_w * self.delta_x * \
-                           self.delta_i / (self.delta_v * self.delta_g)
-        #         print('adc LSB ration:', self.delta_i/self.max_i_LSB)
-        output_clip = F.hardtanh(output_crxb, min_val=-self.h_lvl * self.delta_i.item(),
-                                 max_val=self.h_lvl * self.delta_i.item())
-        output_adc = adc(output_clip, self.delta_i, self.delta_y)
-
-        output_sum = torch.sum(output_adc, dim=2)
-        output = output_sum.view(output_sum.shape[0],
-                                 output_sum.shape[1] * output_sum.shape[2],
-                                 self.h_out,
-                                 self.w_out).index_select(dim=1, index=self.nchout_index)
-        if self.bias is not None:
-            output += torch.index_select(self.bias, 0, index).unsqueeze(1).unsqueeze(1)
-
-        return output
-
-    def _reset_delta(self):
-        self.delta_in_sum.data[0] = 0
-        self.delta_out_sum.data[0] = 0
-        self.counter.data[0] = 0
-
-
-class crxb_Conv2d(nn.Conv2d):
-    """
-    This is the custom conv layer that takes non-ideal effects of ReRAM crossbar into account. It has three functions.
-    1) emulate the DAC at the input of the crossbar and qnantize the input and weight tensors.
-    2) map the quantized tensor to the ReRAM crossbar arrays and include non-ideal effects such as noise, ir drop, and
-        SAF.
-    3) emulate the ADC at the output of he crossbar and convert the current back to digital number
-        to the input of next layers
-
-    Args:
-        ir_drop(bool): switch that enables the ir drop calculation.
-        device(torch.device): device index to select. It’s a no-op if this argument is a negative integer or None.
-        gmax(float): maximum conductance of the ReRAM.
-        gmin(float): minimun conductance of the ReRAM.
-        gwire(float): conductance of the metal wire.
-        gload(float): load conductance of the ADC and DAC.
-        scaler_dw(float): weight quantization scaler to reduce the influence of the ir drop.
-        vdd(float): supply voltage.
-        enable_stochastic_noise(bool): switch to enable stochastic_noise.
-        freq(float): operating frequency of the ReRAM crossbar.
-        temp(float): operating temperature of ReRAM crossbar.
-        crxb_size(int): size of the crossbar.
-        quantize(int): quantization resolution of the crossbar.
-        enable_SAF(bool): switch to enable SAF
-        enable_ec_SAF(bool): switch to enable SAF error correction.
-    """
-
-    def __init__(self, in_channels, out_channels, kernel_size, ir_drop, device, gmax, gmin, gwire,
-                 gload, scaler_dw=1, vdd=3.3, stride=1, padding=0, dilation=1, enable_noise=True,
-                 freq=10e6, temp=300, groups=1, bias=True, crxb_size=64, quantize=8, enable_SAF=False,
-                 enable_ec_SAF=False):
-        super(crxb_Conv2d, self).__init__(in_channels, out_channels, kernel_size,
-                                          stride, padding, dilation, groups, bias)
-
-        assert self.groups == 1, "currently not support grouped convolution for custom conv"
-
-        self.ir_drop = ir_drop
-        self.device = device
-
-        ################## Crossbar conversion #############################
-        self.crxb_size = crxb_size
-        self.enable_ec_SAF = enable_ec_SAF
-
         self.nchout_index = nn.Parameter(torch.arange(self.out_channels), requires_grad=False)
         weight_flatten = self.weight.view(self.out_channels, -1)
         self.crxb_row, self.crxb_row_pads = self.num_pad(
@@ -316,9 +123,201 @@ class crxb_Conv2d(nn.Conv2d):
                                 max_val=self.h_lvl * self.delta_x.item())
         input_quan = quantize_input(
             input_clip, self.delta_x) * self.delta_v  # convert to voltage
-
         weight_quan = quantize_weight(self.weight, self.delta_w)
 
+        # 2. Perform the computation between input voltage and weight conductance
+        if self.h_out is None and self.w_out is None:
+            self.h_out = int(
+                (input.shape[2] - self.kernel_size[0] + 2 * self.padding[0]) / self.stride[0] + 1)
+            self.w_out = int(
+                (input.shape[3] - self.kernel_size[0] + 2 * self.padding[0]) / self.stride[0] + 1)
+        output_list = []
+        input_unfold_list = []
+        for i in range(self.in_channels):
+            input_quan_i = torch.index_select(input_quan, 1, torch.tensor([i]).to(input.device))
+            input_unfold = F.unfold(input_quan_i, kernel_size=self.kernel_size[0],
+                                    dilation=self.dilation, padding=self.padding, stride=self.stride)
+            input_unfold_list.append(input_unfold)
+        
+        for i in range(self.in_channels):
+            input_quan_i = torch.index_select(input_quan, 1, torch.tensor([i]).to(input.device))
+            weight_quan_i = torch.index_select(weight_quan, 0, torch.tensor([i]).to(input.device)) 
+            # 2.1 flatten and unfold the weight and input
+#             input_unfold = F.unfold(input_quan_i, kernel_size=self.kernel_size[0],
+#                                     dilation=self.dilation, padding=self.padding, stride=self.stride)
+            input_unfold = input_unfold_list[i]
+            weight_flatten_channel = weight_quan_i.view(1, -1)
+            
+            crxb_row_channel, crxb_row_pads_channel = self.num_pad(
+                weight_flatten_channel.shape[1], self.crxb_size)
+            crxb_col_channel, crxb_col_pads_channel = self.num_pad(
+                weight_flatten_channel.shape[0], self.crxb_size)
+            w_pad_channel = (0, crxb_row_pads_channel, 0, crxb_col_pads_channel)
+        
+            # 2.2. add paddings
+            weight_padded_channel = F.pad(weight_flatten_channel, w_pad_channel,
+                                      mode='constant', value=0)
+    #         print('self.input_pad', self.input_pad)
+            input_pad_channel = (0, 0, 0, self.crxb_row_pads)
+            input_padded = F.pad(input_unfold, input_pad_channel,
+                                 mode='constant', value=0)
+    #         print('input_padded shape', input_padded.size())
+            # 2.3. reshape to crxb size
+            input_crxb = input_padded.view(input_quan_i.shape[0], 1, self.crxb_row,
+                                           self.crxb_size, input_padded.shape[2])
+    #         print('input_crxb shape', input_crxb.size())
+            weight_crxb = weight_padded_channel.view(crxb_col_channel, self.crxb_size,
+                                             crxb_row_channel, self.crxb_size).transpose(1, 2)
+            # convert the floating point weight into conductance pair values
+            G_crxb = self.w2g(weight_crxb)
+            # 2.4. compute matrix multiplication followed by reshapes
+            output_crxb = torch.matmul(G_crxb[0], input_crxb) - \
+                          torch.matmul(G_crxb[1], input_crxb)
+            # 3. perform ADC operation (i.e., current to digital conversion)
+            with torch.no_grad():
+                if self.training:
+                    self.delta_i = output_crxb.abs().max() / (self.h_lvl)
+                    self.delta_out_sum.data += self.delta_i
+                else:
+                    self.delta_i = self.delta_out_sum.data / (self.counter.data*self.in_channels)
+                self.delta_y = self.delta_w * self.delta_x * \
+                               self.delta_i / (self.delta_v * self.delta_g)
+
+            output_clip = F.hardtanh(output_crxb, min_val=-self.h_lvl * self.delta_i.item(),
+                                     max_val=self.h_lvl * self.delta_i.item())
+            output_adc = adc(output_clip, self.delta_i, self.delta_y)
+
+            output_sum = torch.sum(output_adc, dim=2)
+            output_channel = output_sum.view(output_sum.shape[0],
+                                     output_sum.shape[1] * output_sum.shape[2],
+                                     self.h_out,
+                                     self.w_out).index_select(dim=1, index=torch.tensor([0]).to(input.device))
+            output_list.append(output_channel)
+        output = torch.cat(output_list, 1)
+        if self.bias is not None:
+            output += self.bias.unsqueeze(1).unsqueeze(1)
+        return output
+
+    def _reset_delta(self):
+        self.delta_in_sum.data[0] = 0
+        self.delta_out_sum.data[0] = 0
+        self.counter.data[0] = 0
+
+class crxb_Conv2d(nn.Conv2d):
+    """
+    This is the custom conv layer that takes non-ideal effects of ReRAM crossbar into account. It has three functions.
+    1) emulate the DAC at the input of the crossbar and qnantize the input and weight tensors.
+    2) map the quantized tensor to the ReRAM crossbar arrays and include non-ideal effects such as noise, ir drop, and
+        SAF.
+    3) emulate the ADC at the output of he crossbar and convert the current back to digital number
+        to the input of next layers
+
+    Args:
+        ir_drop(bool): switch that enables the ir drop calculation.
+        device(torch.device): device index to select. It’s a no-op if this argument is a negative integer or None.
+        gmax(float): maximum conductance of the ReRAM.
+        gmin(float): minimun conductance of the ReRAM.
+        gwire(float): conductance of the metal wire.
+        gload(float): load conductance of the ADC and DAC.
+        scaler_dw(float): weight quantization scaler to reduce the influence of the ir drop.
+        vdd(float): supply voltage.
+        enable_stochastic_noise(bool): switch to enable stochastic_noise.
+        freq(float): operating frequency of the ReRAM crossbar.
+        temp(float): operating temperature of ReRAM crossbar.
+        crxb_size(int): size of the crossbar.
+        quantize(int): quantization resolution of the crossbar.
+        enable_SAF(bool): switch to enable SAF
+        enable_ec_SAF(bool): switch to enable SAF error correction.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, ir_drop, device, gmax, gmin, gwire,
+                 gload, scaler_dw=1, vdd=3.3, stride=1, padding=0, dilation=1, enable_noise=True,
+                 freq=10e6, temp=300, groups=1, bias=True, crxb_size=64, quantize=8, enable_SAF=False,
+                 enable_ec_SAF=False):
+        super(crxb_Conv2d, self).__init__(in_channels, out_channels, kernel_size,
+                                          stride, padding, dilation, groups, bias)
+
+        assert self.groups == 1, "currently not support grouped convolution for custom conv"
+
+        self.ir_drop = ir_drop
+        self.device = device
+
+        ################## Crossbar conversion #############################
+        self.crxb_size = crxb_size
+        self.enable_ec_SAF = enable_ec_SAF
+
+        self.nchout_index = nn.Parameter(torch.arange(self.out_channels), requires_grad=False)
+        weight_flatten = self.weight.view(self.out_channels, -1)
+#         print('weight_flatten shape', weight_flatten.shape)
+
+        self.crxb_row, self.crxb_row_pads = self.num_pad(
+            weight_flatten.shape[1], self.crxb_size)
+        self.crxb_col, self.crxb_col_pads = self.num_pad(
+            weight_flatten.shape[0], self.crxb_size)
+        self.h_out = None
+        self.w_out = None
+        self.w_pad = (0, self.crxb_row_pads, 0, self.crxb_col_pads)
+        self.input_pad = (0, 0, 0, self.crxb_row_pads)
+        weight_padded = F.pad(weight_flatten, self.w_pad,
+                              mode='constant', value=0)
+#         print('weight_padded shape', weight_padded.shape)
+        weight_crxb = weight_padded.view(self.crxb_col, self.crxb_size,
+                                         self.crxb_row, self.crxb_size).transpose(1, 2)
+
+        ################# Hardware conversion ##############################
+        # weight and input levels
+        self.n_lvl = 2 ** quantize
+        self.h_lvl = (self.n_lvl - 2) / 2
+        # ReRAM cells
+        self.Gmax = gmax  # max conductance
+        self.Gmin = gmin  # min conductance
+        self.delta_g = (self.Gmax - self.Gmin) / (2 ** 7)  # conductance step
+        self.w2g = w2g(self.delta_g, Gmin=self.Gmin, G_SA0=self.Gmax,
+                       G_SA1=self.Gmin, weight_shape=weight_crxb.shape, enable_SAF=enable_SAF)
+        self.Gwire = gwire
+        self.Gload = gload
+        # DAC
+        self.Vdd = vdd  # unit: volt
+        self.delta_v = self.Vdd / (self.n_lvl - 1)
+        self.delta_in_sum = nn.Parameter(torch.Tensor(1), requires_grad=False)
+        self.delta_out_sum = nn.Parameter(torch.Tensor(1), requires_grad=False)
+        self.counter = nn.Parameter(torch.Tensor(1), requires_grad=False)
+        self.scaler_dw = scaler_dw
+
+        ################ Stochastic Conductance Noise setup #########################
+        # parameters setup
+        self.enable_stochastic_noise = enable_noise
+        self.freq = freq  # operating frequency
+        self.kb = 1.38e-23  # Boltzmann const
+        self.temp = temp  # temperature in kelvin
+        self.q = 1.6e-19  # electron charge
+
+        self.tau = 0.5  # Probability of RTN
+        self.a = 1.662e-7  # RTN fitting parameter
+        self.b = 0.0015  # RTN fitting parameter
+
+    def num_pad(self, source, target):
+        crxb_index = math.ceil(source / target)
+        num_padding = crxb_index * target - source
+        return crxb_index, num_padding
+
+    def forward(self, input):
+        # 1. input data and weight quantization
+        with torch.no_grad():
+            self.delta_w = self.weight.abs().max() / self.h_lvl * self.scaler_dw
+            if self.training:
+                self.counter.data += 1
+                self.delta_x = input.abs().max() / self.h_lvl
+                self.delta_in_sum.data += self.delta_x
+            else:
+                self.delta_x = self.delta_in_sum.data / self.counter.data
+
+        input_clip = F.hardtanh(input, min_val=-self.h_lvl * self.delta_x.item(),
+                                max_val=self.h_lvl * self.delta_x.item())
+        input_quan = quantize_input(
+            input_clip, self.delta_x) * self.delta_v  # convert to voltage
+        weight_quan = quantize_weight(self.weight, self.delta_w)
+        
         # 2. Perform the computation between input voltage and weight conductance
         if self.h_out is None and self.w_out is None:
             self.h_out = int(
@@ -337,18 +336,15 @@ class crxb_Conv2d(nn.Conv2d):
         input_padded = F.pad(input_unfold, self.input_pad,
                              mode='constant', value=0)
         # 2.3. reshape to crxb size
-
         input_crxb = input_padded.view(input.shape[0], 1, self.crxb_row,
                                        self.crxb_size, input_padded.shape[2])
         weight_crxb = weight_padded.view(self.crxb_col, self.crxb_size,
                                          self.crxb_row, self.crxb_size).transpose(1, 2)
+#         print('weight_crxb shape',  weight_crxb.shape)
         # convert the floating point weight into conductance pair values
         G_crxb = self.w2g(weight_crxb)
 
         # 2.4. compute matrix multiplication followed by reshapes
-        for i in range(input.shape[0]):
-            input_crxb = input_padded.view(input.shape[0], 1, self.crxb_row,
-                                           self.crxb_size, input_padded.shape[2])
         # this block is for introducing stochastic noise into ReRAM conductance
         if self.enable_stochastic_noise:
             rand_p = nn.Parameter(torch.Tensor(G_crxb.shape),
@@ -374,8 +370,7 @@ class crxb_Conv2d(nn.Conv2d):
                 G_p[rand_p.ge(self.tau)] = 0
                 G_g = grms * rand_g
             G_crxb += (G_g.cuda() + G_p)
-
-
+        
         # this block is to calculate the ir drop of the crossbar
         if self.ir_drop:
             from .IR_solver import IrSolver
@@ -407,7 +402,6 @@ class crxb_Conv2d(nn.Conv2d):
         else:
             output_crxb = torch.matmul(G_crxb[0], input_crxb) - \
                           torch.matmul(G_crxb[1], input_crxb)
-
         # 3. perform ADC operation (i.e., current to digital conversion)
         with torch.no_grad():
             if self.training:
@@ -421,7 +415,6 @@ class crxb_Conv2d(nn.Conv2d):
         output_clip = F.hardtanh(output_crxb, min_val=-self.h_lvl * self.delta_i.item(),
                                  max_val=self.h_lvl * self.delta_i.item())
         output_adc = adc(output_clip, self.delta_i, self.delta_y)
-
         if self.w2g.enable_SAF:
             if self.enable_ec_SAF:
                 G_pos_diff, G_neg_diff = self.w2g.error_compensation()
@@ -434,7 +427,6 @@ class crxb_Conv2d(nn.Conv2d):
                                  output_sum.shape[1] * output_sum.shape[2],
                                  self.h_out,
                                  self.w_out).index_select(dim=1, index=self.nchout_index)
-
         if self.bias is not None:
             output += self.bias.unsqueeze(1).unsqueeze(1)
 

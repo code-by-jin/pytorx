@@ -44,11 +44,7 @@ class Net(nn.Module):
     def __init__(self, crxb_size, gmin, gmax, gwire, gload, vdd, ir_drop, freq, temp, device, scaler_dw, enable_noise,
                  enable_SAF, enable_ec_SAF):
         super(Net, self).__init__()
-        # self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
-        # self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
-        # self.conv2_drop = nn.Dropout2d()
-        # self.fc1 = nn.Linear(320, 50)
-        # self.fc2 = nn.Linear(50, 10)
+
         self.conv1 = crxb_Conv2d(1, 10, kernel_size=5, crxb_size=crxb_size, scaler_dw=scaler_dw,
                                  gwire=gwire, gload=gload, gmax=gmax, gmin=gmin, vdd=vdd, freq=freq, temp=temp, 
                                  enable_SAF=enable_SAF, enable_ec_SAF=enable_ec_SAF,
@@ -57,10 +53,6 @@ class Net(nn.Module):
                                  gwire=gwire, gload=gload, gmax=gmax, gmin=gmin, vdd=vdd, freq=freq, temp=temp, groups = 10,
                                  enable_SAF=enable_SAF, enable_ec_SAF=enable_ec_SAF,
                                  enable_noise=enable_noise, ir_drop=ir_drop, device=device)
-#         self.conv2 = crxb_Conv2d(10, 10, kernel_size=5, crxb_size=crxb_size, scaler_dw=scaler_dw,
-#                                  gwire=gwire, gload=gload, gmax=gmax, gmin=gmin, vdd=vdd, freq=freq, temp=temp, 
-#                                  enable_SAF=enable_SAF, enable_ec_SAF=enable_ec_SAF,
-#                                  enable_noise=enable_noise, ir_drop=ir_drop, device=device)
         self.conv3 = crxb_Conv2d(10, 20, kernel_size=1, crxb_size=crxb_size, scaler_dw=scaler_dw,
                                  gwire=gwire, gload=gload, gmax=gmax, gmin=gmin, vdd=vdd, freq=freq, temp=temp, 
                                  enable_SAF=enable_SAF, enable_ec_SAF=enable_ec_SAF,
@@ -145,16 +137,17 @@ def validate(args, model, device, criterion, val_loader):
 
         return test_loss
 
-
 def main():
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
+    parser.add_argument('--cuda', type=str, default='0', metavar='C',
+                        help='CUDA Visible devices')
     parser.add_argument('--batch_size', type=int, default=1000, metavar='N',
                         help='input batch size for training (default: 64)')
     parser.add_argument('--test_batch_size', type=int, default=100, metavar='N',
                         help='input batch size for testing (default: 1000)')
     parser.add_argument('--epochs', type=int, default=1, metavar='N',
-                        help='number of epochs to train (default: 10)')
+                        help='number of epochs to train (default: 1)')
     parser.add_argument('--lr', type=float, default=0.5, metavar='LR',
                         help='learning rate (default: 0.01)')
     parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
@@ -195,7 +188,6 @@ def main():
     parser.add_argument('--temp', type=float, default=300,
                         help='scaler to compress the conductance')
 
-
     args = parser.parse_args()
 
     best_error = 0
@@ -210,10 +202,8 @@ def main():
         raise KeyError("Noise can cause unsuccessful training!")
 
     use_cuda = not args.no_cuda and torch.cuda.is_available()
-
     torch.manual_seed(args.seed)
-
-    device = torch.device("cuda" if use_cuda else "cpu")
+    device = torch.device('cuda:'+args.cuda if use_cuda else "cpu")
 
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
     train_loader = torch.utils.data.DataLoader(
@@ -234,6 +224,7 @@ def main():
     model = Net(crxb_size=args.crxb_size, gmax=args.gmax, gmin=args.gmin, gwire=args.gwire, gload=args.gload,
                 vdd=args.vdd, ir_drop=args.ir_drop, device=device, scaler_dw=args.scaler_dw, freq=args.freq, temp=args.temp,
                 enable_SAF=args.enable_SAF, enable_noise=args.enable_noise, enable_ec_SAF=args.enable_ec_SAF).to(device)
+    
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
     criterion = torch.nn.CrossEntropyLoss().to(device)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2,
